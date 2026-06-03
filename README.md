@@ -134,3 +134,17 @@ Each tool call writes logs under `<project_root>\.gowin-mcp\logs\`:
 
 - This is unofficial software and is not affiliated with Gowin.
 - Programming hardware can affect your FPGA/board. Use at your own risk.
+
+## Tested
+
+This server is **Windows 11 only** and has been validated end-to-end against the following setup:
+
+- **OS:** Windows 11 (single-language edition)
+- **Gowin IDE:** `C:\Gowin\Gowin_V1.9.11.03_Education_x64`
+  - `IDE\bin\gw_sh.exe`
+  - `Programmer\bin\programmer_cli.exe`
+- **FPGA board:** Sipeed **Tang Nano 9K** (Gowin GW1NR-9C)
+  - `gowin.run_tcl` and `gowin.program_fs` exercised against this board.
+  - `gowin.list_cables` validated with the Tang Nano 9K's FT2232HL-based programmer attached.
+
+If you use a different board, cable, or IDE version you may need to override `gowin_ide_path` per tool call. Other operating systems (macOS, Linux) are **not** supported by this build.

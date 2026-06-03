@@ -149,6 +149,22 @@ fn resolve_under(project_root: &Path, p: &str) -> PathBuf {
     }
 }
 
+fn list_cables_arg_candidates() -> Vec<Vec<String>> {
+    vec![
+        vec!["--list-cables".into()],
+        vec!["--list_cables".into()],
+        vec!["--cableList".into()],
+        vec!["--listCable".into()],
+        vec!["--cables".into()],
+        vec!["--scan-cables".into()],
+        vec!["--scan_cables".into()],
+        vec!["-l".into()],
+        vec!["--list".into()],
+        vec!["--scan".into()],
+        vec!["--enumerate".into()],
+    ]
+}
+
 fn gowin_paths(gowin_ide_path: &str) -> (PathBuf, PathBuf, PathBuf) {
     // Windows 11 レイアウト:
     //   <ide_root>\IDE\bin\gw_sh.exe
@@ -472,17 +488,7 @@ impl GowinMcp {
             ));
         }
 
-        let candidates: Vec<Vec<String>> = vec![
-            vec!["--list-cables".into()],
-            vec!["--list_cables".into()],
-            vec!["--cableList".into()],
-            vec!["--listCable".into()],
-            vec!["--cables".into()],
-            vec!["-l".into()],
-            vec!["--list".into()],
-            vec!["--scan".into()],
-            vec!["--enumerate".into()],
-        ];
+        let candidates: Vec<Vec<String>> = list_cables_arg_candidates();
 
         let mut attempts = Vec::new();
         let mut cables: Vec<String> = Vec::new();
@@ -613,11 +619,13 @@ impl GowinMcp {
             ));
         }
 
-        let mut selected_cable = req.cable;
+        let mut selected_cable = req.cable.as_deref().map(str::trim).map(str::to_string);
+        let mut all_cables: Vec<String> = Vec::new();
         let mut list_cables_attempts: Option<Vec<Attempt>> = None;
 
         if selected_cable.is_none() {
-            // 内部的に list_cables を呼んで先頭を選ぶ
+            // 内部的に list_cables を呼んで全件取得。
+            // 先頭だけでなく全候補で `--cable` を試行できるよう保存する。
             let list = self
                 .list_cables(Parameters(ListCablesRequest {
                     project_root: Some(project_root.display().to_string()),
@@ -627,7 +635,8 @@ impl GowinMcp {
                 .await?
                 .0;
             list_cables_attempts = Some(list.attempts.clone());
-            selected_cable = list.cables.first().cloned();
+            all_cables = list.cables.clone();
+            selected_cable = all_cables.first().cloned();
         }
 
         let base_args: Vec<String> = vec![
@@ -642,6 +651,8 @@ impl GowinMcp {
         ];
 
         let mut variants: Vec<(String, Vec<String>)> = Vec::new();
+
+        // 1) ユーザー指定の cable を最優先で試す (既に trim 済み)
         if let Some(cable) = selected_cable.clone() {
             let mut argv = Vec::new();
             argv.extend(base_args.iter().take(4).cloned());
@@ -650,6 +661,21 @@ impl GowinMcp {
             argv.extend(base_args.iter().skip(4).cloned());
             variants.push(("with_cable".into(), argv));
         }
+
+        // 2) list_cables が返した全候補を順番に試す (1 以外)
+        for (i, cable) in all_cables.iter().enumerate().skip(1) {
+            if Some(cable.as_str()) == selected_cable.as_deref() {
+                continue;
+            }
+            let mut argv = Vec::new();
+            argv.extend(base_args.iter().take(4).cloned());
+            argv.push("--cable".into());
+            argv.push(cable.clone());
+            argv.extend(base_args.iter().skip(4).cloned());
+            variants.push((format!("with_cable[{}]", i), argv));
+        }
+
+        // 3) 最後のフォールバック: --cable 無しで 1 回だけ試す
         variants.push(("without_cable".into(), base_args.clone()));
 
         let mut tried: Vec<VariantTried> = Vec::new();
@@ -868,65 +894,230 @@ struct ProgramFsResponse {
 }
 
 fn parse_cable_names(text: &str) -> Vec<String> {
+    // Windows 11 / Gowin programmer_cli 実機で観察される出力形式に対応する。
+    // 入力は自由形式テキスト (stdout + stderr)。発見順に重複排除して返す。
+    //
+    // 主な抽出対象:
+    //   "Target Cable: Gowin USB Cable(FT2CH)"
+    //   "Cable found: Gowin USB Cable(FT2CH)"
+    //   "  1. Gowin USB Cable(FT2CH)"  (番号付きリスト)
+    //   [1] "Gowin USB Cable(FT2CH)"
+    //   引用符で囲まれた名前
     let mut found: Vec<String> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for line in text.lines() {
-        let l = line.trim();
-        if l.is_empty() {
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
             continue;
         }
-        let stripped = l
-            .trim_start_matches(|c: char| {
-                c.is_ascii_digit()
-                    || c == '['
-                    || c == ']'
-                    || c == '.'
-                    || c == ')'
-                    || c == '-'
-                    || c.is_whitespace()
-            })
-            .trim();
 
-        // 引用符つき
-        for cap in stripped.match_indices('"') {
-            let _ = cap;
+        // 0) 「Target Cable: ...」「Cable found: ...」形式 (Windows programmer_cli 実機の出力)
+        //    ラベル側は case-insensitive でマッチさせ、値側のみ抽出する。
+        for label in ["Target Cable:", "Cable found:", "Cable:", "Cable Name:"] {
+            if let Some(pos) = line.to_lowercase().find(&label.to_lowercase()) {
+                let value_start = pos + label.len();
+                let v = line[value_start..].trim().trim_matches('"').trim();
+                push_if_cable_like(&mut found, &mut seen, v);
+            }
         }
-        // "..." をざっくり抽出
-        let mut rest = stripped;
+
+        // 0b) programmer_cli のスキャン形式: "IDCode : 0x..." 単独行で、その直前行/前行群に
+        //     ケーブル名が含まれているケース。実機では次のようなブロックが観察される:
+        //         cable index:0
+        //         Cable Name: Gowin USB Cable(FT2CH)
+        //         IDCode : 0x0110083B
+        //     上記 (1) の "Cable Name:" で既に拾えるが、IDCode 単独行が来たタイミングでも
+        //     直前の抽出済み名前にサフィックス除去を再度かけて、ケーブル名の安定性を上げる。
+        if line.to_lowercase().contains("idcode") {
+            // 直近で push 済みの最後にサフィックス除去を適用 (冪等なので問題なし)
+            if let Some(last) = found.last_mut() {
+                let cleaned = strip_cable_suffix(last);
+                if !cleaned.is_empty() && cleaned != *last {
+                    if seen.remove(last) {
+                        seen.insert(cleaned.clone());
+                        *last = cleaned;
+                    }
+                }
+            }
+        }
+
+        // 1) 引用符で囲まれた名前を抽出
+        let mut rest = line;
         while let Some(start) = rest.find('"') {
             let after = &rest[start + 1..];
             if let Some(end) = after.find('"') {
                 let v = after[..end].trim();
-                let low = v.to_lowercase();
-                if (low.contains("cable") || low.contains("gowin")) && seen.insert(v.to_string()) {
-                    found.push(v.to_string());
-                }
+                push_if_cable_like(&mut found, &mut seen, v);
                 rest = &after[end + 1..];
             } else {
                 break;
             }
         }
 
-        // 典型名
-        if stripped.to_lowercase().contains("gowin usb cable") && seen.insert(stripped.to_string())
-        {
-            found.push(stripped.to_string());
-        }
-
-        // Cable: xxx
-        if let Some(idx) = stripped.to_lowercase().find("cable") {
-            let tail = &stripped[idx..];
-            if let Some(pos) = tail.find(':').or_else(|| tail.find('=')) {
-                let v = tail[pos + 1..].trim().trim_matches('"');
-                if !v.is_empty() && seen.insert(v.to_string()) {
-                    found.push(v.to_string());
-                }
+        // 2) 番号付きリスト (例: "1. Gowin USB Cable(FT2CH)" / "[1] Gowin USB Cable(FT2CH)")
+        let stripped = line
+            .trim_start_matches(|c: char| {
+                c.is_ascii_digit() || c == '[' || c == ']' || c == '.' || c == ')' || c == '-'
+            })
+            .trim();
+        // 全体が "Gowin ... Cable ..." で、明らかに名前っぽい短い行なら採用
+        if !stripped.is_empty() && stripped.len() <= 80 {
+            let low = stripped.to_lowercase();
+            if (low.starts_with("gowin") && low.contains("cable"))
+                || low.contains("usb cable")
+                || low.contains("ft2ch")
+                || low.contains("ft2232")
+            {
+                push_if_cable_like(&mut found, &mut seen, stripped);
             }
         }
     }
 
     found
+}
+
+fn push_if_cable_like(
+    found: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    candidate: &str,
+) {
+    let v = strip_cable_suffix(candidate.trim().trim_matches('"').trim());
+    if v.is_empty() {
+        return;
+    }
+    // 明らかにノイズ (バージョン番号やカッコ内に閉じている単体記号など) を弾く
+    if v.len() < 3 {
+        return;
+    }
+    let low = v.to_lowercase();
+    // "cable" を含むか、FTDI 系 / Gowin 系のヒント語を含むか
+    let cable_like = low.contains("cable")
+        || low.contains("gowin")
+        || low.contains("ft2ch")
+        || low.contains("ft2232")
+        || low.contains("usb");
+    if !cable_like {
+        return;
+    }
+    if seen.insert(v.to_string()) {
+        found.push(v.to_string());
+    }
+}
+
+/// Gowin programmer_cli が吐くケーブル名から、デバイス ID 系のサフィックスを落とす。
+///
+/// 例 (Windows 11 / programmer_cli 実機):
+///   `Gowin USB Cable(FT2CH)/0/0/null` → `Gowin USB Cable(FT2CH)`
+///   `Gowin USB Cable (FT2CH) / 1 / 2` → `Gowin USB Cable (FT2CH)`
+///   `Gowin USB Cable(FT2CH)`           → `Gowin USB Cable(FT2CH)` (不変)
+///
+/// `--cable` 引数に `/idx/...` が含まれると programmer_cli は
+/// `argument --cable: invalid choice` を返すので、ここで必ず正規化する。
+fn strip_cable_suffix(name: &str) -> String {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // "/0/0/null" "/1/2/null" "/0/0" のように "/<segment>" が 2 個以上連続する
+    // 場合はデバイス ID 系のサフィックスなので取り除く。
+    //
+    // 例:
+    //   "FTUSB-1B (JTAG-USB Cable)/0/0/null" → 2 個以上のサフィックス →  strip
+    //   "GW2A-LV18PG256C8/I7"               → 1 個のサフィックス →       保持
+    //
+    // 注意: "GW2A-LV18PG256C8/I7" のようにデバイス識別子付きの名前を 1 個の
+    // サフィックスで strip すると、本来のデバイス名 "GW2A-LV18PG256C8" と衝突
+    // してしまうため、安全側に倒して 1 個の場合は保持する。
+    let slash_count = trimmed.matches('/').count();
+    if slash_count >= 2 {
+        if let Some(pos) = trimmed.find('/') {
+            return trimmed[..pos].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
+#[cfg(test)]
+mod parser_tests {
+    use super::*;
+
+    #[test]
+    fn strip_cable_suffix_removes_double_slash_suffix() {
+        assert_eq!(strip_cable_suffix("FTUSB-1B (JTAG-USB Cable)/0/0/null"), "FTUSB-1B (JTAG-USB Cable)");
+        assert_eq!(strip_cable_suffix("FTUSB-1B (JTAG-USB Cable)/1/2/null"), "FTUSB-1B (JTAG-USB Cable)");
+    }
+
+    #[test]
+    fn strip_cable_suffix_keeps_clean_name() {
+        assert_eq!(strip_cable_suffix("FTUSB-1B (JTAG-USB Cable)"), "FTUSB-1B (JTAG-USB Cable)");
+    }
+
+    #[test]
+    fn strip_cable_suffix_keeps_single_segment_suffix() {
+        // 1 個のサフィックス ("/I7" など) はデバイス ID の一部として保持する。
+        // strip すると素のデバイス名 "GW2A-LV18PG256C8" と衝突する。
+        assert_eq!(strip_cable_suffix("GW2A-LV18PG256C8/I7"), "GW2A-LV18PG256C8/I7");
+    }
+
+    #[test]
+    fn strip_cable_suffix_handles_empty_and_whitespace() {
+        assert_eq!(strip_cable_suffix(""), "");
+        assert_eq!(strip_cable_suffix("   "), "");
+        assert_eq!(strip_cable_suffix("  name/0/0/null  "), "name");
+    }
+}
+
+#[cfg(test)]
+mod list_cables_arg_tests {
+    use super::*;
+
+    #[test]
+    fn list_cables_arg_candidates_includes_scan_cables() {
+        // `--scan-cables` は programmer_cli の公式オプション (JTAGLoading モード)
+        // 必ず候補に含めること（scan_cable_attempts に依存させない）。
+        let candidates = list_cables_arg_candidates();
+        let joined: Vec<String> = candidates
+            .iter()
+            .map(|argv| argv.join(" "))
+            .collect();
+        assert!(
+            joined.iter().any(|c| c.contains("scan-cables")),
+            "--scan-cables must be in candidate list: {:?}",
+            joined
+        );
+    }
+
+    #[test]
+    fn list_cables_arg_candidates_non_empty() {
+        let candidates = list_cables_arg_candidates();
+        assert!(!candidates.is_empty(), "candidate list must not be empty");
+        for c in &candidates {
+            assert!(!c.is_empty(), "empty candidate in {:?}", candidates);
+            for arg in c {
+                assert!(!arg.trim().is_empty(), "empty arg in {:?}", c);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod gowin_paths_tests {
+    use super::*;
+
+    #[test]
+    fn gowin_paths_windows_layout() {
+        let (ide_base, gw_sh, programmer_cli) = gowin_paths(r"C:\Gowin\Gowin_V1.9.11.03_Education_x64");
+        assert_eq!(ide_base, PathBuf::from(r"C:\Gowin\Gowin_V1.9.11.03_Education_x64\IDE"));
+        assert_eq!(
+            gw_sh,
+            PathBuf::from(r"C:\Gowin\Gowin_V1.9.11.03_Education_x64\IDE\bin\gw_sh.exe")
+        );
+        assert_eq!(
+            programmer_cli,
+            PathBuf::from(r"C:\Gowin\Gowin_V1.9.11.03_Education_x64\Programmer\bin\programmer_cli.exe")
+        );
+    }
 }
 
 #[tokio::main]
