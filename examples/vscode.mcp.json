@@ -2,7 +2,7 @@
 	"$schema": "https://modelcontextprotocol.io/schemas/mcp.json",
 	"mcpServers": {
 		"gowin": {
-			"command": "${workspaceFolder}/target/release/gw-synth-flash-mcp",
+			"command": "${workspaceFolder}\\target\\release\\gw-synth-flash-mcp.exe",
 			"args": [],
 			"cwd": "${workspaceFolder}",
 			"env": {

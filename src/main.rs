@@ -22,7 +22,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-const DEFAULT_GOWIN_APP_PATH: &str = "/Applications/GowinIDE.app";
+const DEFAULT_GOWIN_IDE_PATH: &str = r"C:\Gowin\Gowin_V1.9.11.03_Education_x64";
 const DEFAULT_PROJECT_ROOT_ENV: &str = "GOWIN_MCP_PROJECT_ROOT";
 const KILL_WAIT_TIMEOUT_SEC: u64 = 10;
 const MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
@@ -149,43 +149,56 @@ fn resolve_under(project_root: &Path, p: &str) -> PathBuf {
     }
 }
 
-fn gowin_paths(gowin_ide_app_path: &str) -> (PathBuf, PathBuf, PathBuf) {
-    // (ide_base, gw_sh, programmer_cli)
-    let ide_base = PathBuf::from(gowin_ide_app_path).join("Contents/Resources/Gowin_EDA/IDE");
-    let gw_sh = ide_base.join("bin/gw_sh");
-    let programmer_cli = PathBuf::from(gowin_ide_app_path)
-        .join("Contents/Resources/Gowin_EDA/Programmer/bin/programmer_cli");
+fn gowin_paths(gowin_ide_path: &str) -> (PathBuf, PathBuf, PathBuf) {
+    // Windows 11 レイアウト:
+    //   <ide_root>\IDE\bin\gw_sh.exe
+    //   <ide_root>\Programmer\bin\programmer_cli.exe
+    //   <ide_root>\IDE\lib                  (DLL ディレクトリ)
+    //   <ide_root>\Programmer\bin           (programmer_cli の DLL)
+    let ide_root = PathBuf::from(gowin_ide_path);
+    let ide_base = ide_root.join("IDE");
+    let programmer_base = ide_root.join("Programmer");
+    let gw_sh = ide_base.join("bin").join("gw_sh.exe");
+    let programmer_cli = programmer_base.join("bin").join("programmer_cli.exe");
     (ide_base, gw_sh, programmer_cli)
 }
 
-fn gw_sh_env(ide_base: &Path) -> HashMap<String, String> {
-    // 既存 justfile の synth と同等
+fn gw_sh_env(ide_base: &Path, programmer_base: &Path) -> HashMap<String, String> {
+    // Windows 11: PATH に IDE\bin と Programmer\bin を先頭に追加（gw_sh.exe と
+    // programmer_cli.exe 가 의존하는 DLL을 찾을 수 있도록）。
+    // 환경변수의 PATH 보존하여 다른 도구도 계속 동작하게 한다.
     let mut env = HashMap::new();
-    let lib = ide_base.join("lib");
+    let ide_bin = ide_base.join("bin");
+    let programmer_bin = programmer_base.join("bin");
+    let ide_lib = ide_base.join("lib");
 
-    let dyld_library_path = match std::env::var("DYLD_LIBRARY_PATH") {
-        Ok(v) if !v.is_empty() => format!("{}:{v}", lib.display()),
-        _ => lib.display().to_string(),
+    let path_sep = ";";
+    let extra_path = format!(
+        "{}{}{}",
+        ide_bin.display(),
+        path_sep,
+        programmer_bin.display()
+    );
+
+    let path_value = match std::env::var("PATH") {
+        Ok(v) if !v.is_empty() => format!("{extra_path}{path_sep}{v}"),
+        _ => extra_path,
     };
+    env.insert("PATH".into(), path_value);
 
-    let dyld_framework_path = match std::env::var("DYLD_FRAMEWORK_PATH") {
-        Ok(v) if !v.is_empty() => format!("{}:{v}", lib.display()),
-        _ => lib.display().to_string(),
-    };
-
-    env.insert("DYLD_LIBRARY_PATH".into(), dyld_library_path);
-    env.insert("DYLD_FRAMEWORK_PATH".into(), dyld_framework_path);
     env.insert(
         "TCL_LIBRARY".into(),
-        ide_base.join("lib/tcl8.6").display().to_string(),
+        ide_lib.join("tcl8.6").display().to_string(),
     );
     env.insert(
         "TCLLIBPATH".into(),
         format!(
-            "{}:{}:{}",
-            ide_base.join("lib").display(),
-            ide_base.join("lib/itcl4.0.3").display(),
-            ide_base.join("lib/tcl8.6").display(),
+            "{}{}{}{}{}",
+            ide_lib.display(),
+            path_sep,
+            ide_lib.join("itcl4.0.3").display(),
+            path_sep,
+            ide_lib.join("tcl8.6").display(),
         ),
     );
 
@@ -304,12 +317,12 @@ impl GowinMcp {
         let req = params.0;
         let project_root = resolve_project_root(req.project_root.as_deref()).await;
 
-        let gowin_ide_app_path = req
-            .gowin_ide_app_path
+        let gowin_ide_path = req
+            .gowin_ide_path
             .as_deref()
-            .unwrap_or(DEFAULT_GOWIN_APP_PATH);
+            .unwrap_or(DEFAULT_GOWIN_IDE_PATH);
 
-        let (ide_base, gw_sh, _programmer_cli) = gowin_paths(gowin_ide_app_path);
+        let (ide_base, gw_sh, _programmer_cli) = gowin_paths(gowin_ide_path);
         let ide_bin_dir = ide_base.join("bin");
 
         let timeout_sec = req.timeout_sec.unwrap_or(1800);
@@ -342,7 +355,8 @@ impl GowinMcp {
             p
         };
 
-        let mut env = gw_sh_env(&ide_base);
+        let programmer_base = PathBuf::from(gowin_ide_path).join("Programmer");
+        let mut env = gw_sh_env(&ide_base, &programmer_base);
         if let Some(extra) = req.env {
             for (k, v) in extra {
                 env.insert(k, v);
@@ -377,7 +391,7 @@ impl GowinMcp {
         let meta_json = serde_json::json!({
             "tool": "gowin.run_tcl",
             "project_root": project_root.display().to_string(),
-            "gowin_ide_app_path": gowin_ide_app_path,
+            "gowin_ide_path": gowin_ide_path,
             "gw_sh": gw_sh.display().to_string(),
             "cwd": ide_bin_dir.display().to_string(),
             "tcl_file": tcl_file_path.display().to_string(),
@@ -406,7 +420,7 @@ impl GowinMcp {
         Ok(Json(RunTclResponse {
             project_root: project_root.display().to_string(),
             tcl_file_path: tcl_file_path.display().to_string(),
-            gowin_ide_app_path: gowin_ide_app_path.to_string(),
+            gowin_ide_path: gowin_ide_path.to_string(),
             exit_code: exec.exit_code,
             timed_out: exec.timed_out,
             duration_ms: exec.duration_ms,
@@ -430,10 +444,10 @@ impl GowinMcp {
 
         let project_root = resolve_project_root(req.project_root.as_deref()).await;
 
-        let gowin_ide_app_path = req
-            .gowin_ide_app_path
+        let gowin_ide_path = req
+            .gowin_ide_path
             .as_deref()
-            .unwrap_or(DEFAULT_GOWIN_APP_PATH);
+            .unwrap_or(DEFAULT_GOWIN_IDE_PATH);
 
         let timeout_sec = req.timeout_sec.unwrap_or(20);
         if timeout_sec == 0 {
@@ -444,15 +458,15 @@ impl GowinMcp {
             ));
         }
 
-        let (_ide_base, _gw_sh, programmer_cli) = gowin_paths(gowin_ide_app_path);
+        let (_ide_base, _gw_sh, programmer_cli) = gowin_paths(gowin_ide_path);
 
         if tokio::fs::metadata(&programmer_cli).await.is_err() {
             return Err(McpError::new(
                 ErrorCode::INVALID_PARAMS,
                 format!(
-                    "programmer_cli が見つかりません: {}。gowin_ide_app_path を確認してください（現在: {}）",
+                    "programmer_cli が見つかりません: {}。gowin_ide_path を確認してください（現在: {}）",
                     programmer_cli.display(),
-                    gowin_ide_app_path
+                    gowin_ide_path
                 ),
                 None,
             ));
@@ -519,7 +533,7 @@ impl GowinMcp {
         let meta_json = serde_json::json!({
             "tool": "gowin.list_cables",
             "project_root": project_root.display().to_string(),
-            "gowin_ide_app_path": gowin_ide_app_path,
+            "gowin_ide_path": gowin_ide_path,
             "programmer_cli": programmer_cli.display().to_string(),
             "attempts": attempts,
             "cables": cables,
@@ -543,7 +557,7 @@ impl GowinMcp {
 
         Ok(Json(ListCablesResponse {
             project_root: project_root.display().to_string(),
-            gowin_ide_app_path: gowin_ide_app_path.to_string(),
+            gowin_ide_path: gowin_ide_path.to_string(),
             cables,
             attempts,
             log_file: log_file.display().to_string(),
@@ -563,12 +577,12 @@ impl GowinMcp {
 
         let project_root = resolve_project_root(req.project_root.as_deref()).await;
 
-        let gowin_ide_app_path = req
-            .gowin_ide_app_path
+        let gowin_ide_path = req
+            .gowin_ide_path
             .as_deref()
-            .unwrap_or(DEFAULT_GOWIN_APP_PATH);
+            .unwrap_or(DEFAULT_GOWIN_IDE_PATH);
 
-        let (_ide_base, _gw_sh, programmer_cli) = gowin_paths(gowin_ide_app_path);
+        let (_ide_base, _gw_sh, programmer_cli) = gowin_paths(gowin_ide_path);
 
         let fs_file_path = req
             .fs_file_path
@@ -607,7 +621,7 @@ impl GowinMcp {
             let list = self
                 .list_cables(Parameters(ListCablesRequest {
                     project_root: Some(project_root.display().to_string()),
-                    gowin_ide_app_path: Some(gowin_ide_app_path.to_string()),
+                    gowin_ide_path: Some(gowin_ide_path.to_string()),
                     timeout_sec: Some(timeout_sec.min(20)),
                 }))
                 .await?
@@ -702,7 +716,7 @@ impl GowinMcp {
         let meta_json = serde_json::json!({
             "tool": "gowin.program_fs",
             "project_root": project_root.display().to_string(),
-            "gowin_ide_app_path": gowin_ide_app_path,
+            "gowin_ide_path": gowin_ide_path,
             "programmer_cli": programmer_cli.display().to_string(),
             "fs_file": fs_abs.display().to_string(),
             "device": device,
@@ -740,7 +754,7 @@ impl GowinMcp {
 
         Ok(Json(ProgramFsResponse {
             project_root: project_root.display().to_string(),
-            gowin_ide_app_path: gowin_ide_app_path.to_string(),
+            gowin_ide_path: gowin_ide_path.to_string(),
             fs_file: fs_abs.display().to_string(),
             selected_cable,
             list_cables_attempts,
@@ -761,7 +775,7 @@ impl ServerHandler for GowinMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "gw-synth-flash-mcp: gw_sh / programmer_cli をLLMから操作するためのMCPサーバー（個人利用向け）".into(),
+                "gw-synth-flash-mcp: gw_sh / programmer_cli をLLMから操作するためのWindows 11向けMCPサーバー（個人利用向け）".into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
             ..Default::default()
@@ -772,7 +786,7 @@ impl ServerHandler for GowinMcp {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct RunTclRequest {
     project_root: Option<String>,
-    gowin_ide_app_path: Option<String>,
+    gowin_ide_path: Option<String>,
     tcl_path: Option<String>,
     tcl_inline: Option<String>,
     timeout_sec: Option<u64>,
@@ -783,7 +797,7 @@ struct RunTclRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct RunTclResponse {
     project_root: String,
-    gowin_ide_app_path: String,
+    gowin_ide_path: String,
     tcl_file_path: String,
     exit_code: i32,
     timed_out: bool,
@@ -804,14 +818,14 @@ struct Attempt {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ListCablesRequest {
     project_root: Option<String>,
-    gowin_ide_app_path: Option<String>,
+    gowin_ide_path: Option<String>,
     timeout_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ListCablesResponse {
     project_root: String,
-    gowin_ide_app_path: String,
+    gowin_ide_path: String,
     cables: Vec<String>,
     attempts: Vec<Attempt>,
     log_file: String,
@@ -821,7 +835,7 @@ struct ListCablesResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ProgramFsRequest {
     project_root: Option<String>,
-    gowin_ide_app_path: Option<String>,
+    gowin_ide_path: Option<String>,
     fs_file_path: Option<String>,
     device: Option<String>,
     frequency: Option<String>,
@@ -839,7 +853,7 @@ struct VariantTried {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ProgramFsResponse {
     project_root: String,
-    gowin_ide_app_path: String,
+    gowin_ide_path: String,
     fs_file: String,
     selected_cable: Option<String>,
     list_cables_attempts: Option<Vec<Attempt>>,

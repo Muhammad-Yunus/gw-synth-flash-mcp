@@ -7,7 +7,7 @@
 
 - 実装: Rust + `rmcp`
 - 目的: LLM/エディタから「任意Tcl実行」「ケーブル自動検出」「SRAM書き込み」を呼べるようにする
-- 対象OS: macOS（現状）
+- 対象OS: Windows 11（現状）
 
 ## このリポの構成（想定）
 
@@ -19,39 +19,41 @@
 
 ## 前提
 
-- Gowin IDE が macOS にインストールされていること
-  - デフォルト: `/Applications/GowinIDE.app`
-  - 変更したい場合: ツール引数の `gowin_ide_app_path` を指定
+- Gowin IDE が Windows 11 にインストールされていること
+  - デフォルト: `C:\Gowin\Gowin_V1.9.11.03_Education_x64`
+    - `IDE\bin\gw_sh.exe`
+    - `Programmer\bin\programmer_cli.exe`
+  - 変更したい場合: ツール引数の `gowin_ide_path` を指定
 
 ## インストール
 
 crates.io からインストール:
 
-```sh
+```powershell
 cargo install gw-synth-flash-mcp
 ```
 
 ## ソースからビルド（開発者向け）
 
-```sh
+```powershell
 cargo build --release
 ```
 
 ローカルソースからインストール:
 
-```sh
+```powershell
 cargo install --path .
 ```
 
 ## 起動（stdio）
 
-```sh
-./target/release/gw-synth-flash-mcp
+```powershell
+.\target\release\gw-synth-flash-mcp.exe
 ```
 
 または（インストール済みなら）:
 
-```sh
+```powershell
 gw-synth-flash-mcp
 ```
 
@@ -63,9 +65,9 @@ gw-synth-flash-mcp
 
 例:
 
-```sh
-export GOWIN_MCP_PROJECT_ROOT="/ABS/PATH/TO/your/project"
-./target/release/gw-synth-flash-mcp
+```powershell
+$env:GOWIN_MCP_PROJECT_ROOT = "C:\ABS\PATH\TO\your\project"
+.\target\release\gw-synth-flash-mcp.exe
 ```
 
 ## クイックスタート
@@ -79,7 +81,7 @@ cargo install gw-synth-flash-mcp
 1) MCPクライアント（VS Code/Copilotなど）の設定に、インストールしたバイナリを指定
 
 - 例: `gw-synth-flash-mcp`（`$PATH` にインストールした場合）
-- または: `${workspaceFolder}/target/release/gw-synth-flash-mcp`（ソースからビルドした場合）
+- または: `${workspaceFolder}\target\release\gw-synth-flash-mcp.exe`（ソースからビルドした場合）
 
 1) 操作したいGowinプロジェクトを `GOWIN_MCP_PROJECT_ROOT`（またはツール引数の `project_root`）で指定
 
@@ -88,7 +90,7 @@ cargo install gw-synth-flash-mcp
 テンプレ: [examples/vscode.mcp.json](examples/vscode.mcp.json)
 
 - `cargo install` でインストールした場合: `gw-synth-flash-mcp` コマンドを使用
-- ソースからビルドした場合: `${workspaceFolder}/target/release/gw-synth-flash-mcp` を使用
+- ソースからビルドした場合: `${workspaceFolder}\target\release\gw-synth-flash-mcp.exe` を使用
 - `GOWIN_MCP_PROJECT_ROOT` を設定して、どこから起動しても同じ project を操作できるようにします
 
 ## Claude Code 接続テンプレ
@@ -96,7 +98,7 @@ cargo install gw-synth-flash-mcp
 テンプレ: [examples/claude-code.mcp.json](examples/claude-code.mcp.json)
 
 - 変数展開が効かない場合に備えて **絶対パス**版
-- `command` / `cwd` / `GOWIN_MCP_PROJECT_ROOT` の `/ABS/PATH/...` を置き換えてください
+- `command` / `cwd` / `GOWIN_MCP_PROJECT_ROOT` の `C:\ABS\PATH\...` を置き換えてください
 
 ## ツール一覧
 
@@ -118,7 +120,7 @@ cargo install gw-synth-flash-mcp
 
 ## ログ
 
-各ツール実行ごとに `<project_root>/.gowin-mcp/logs/` にログを保存します。
+各ツール実行ごとに `<project_root>\.gowin-mcp\logs\` にログを保存します。
 
 - `*.log`: stdout/stderr をまとめたテキスト
 - `*.json`: 実行メタ情報（exit code, duration, 使用引数など）
@@ -126,4 +128,4 @@ cargo install gw-synth-flash-mcp
 ## 注意
 
 - 実機書き込みは FPGA に影響します（自己責任）。
-- ビルド/書き込みをCI等で自動実行する場合、`project_root` と `gowin_ide_app_path` を明示して事故を避けてください。
+- ビルド/書き込みをCI等で自動実行する場合、`project_root` と `gowin_ide_path` を明示して事故を避けてください。

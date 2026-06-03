@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Gowin IDE の CLI ワークフロー (`gw_sh`, `programmer_cli`) を MCP (Model Context Protocol) ツールとして公開する非公式サーバー。Rust 2024 Edition で書かれた単一バイナリ (`gw-synth-flash-mcp`)。macOS 専用。
+Gowin IDE の CLI ワークフロー (`gw_sh`, `programmer_cli`) を MCP (Model Context Protocol) ツールとして公開する非公式サーバー。Rust 2024 Edition で書かれた単一バイナリ (`gw-synth-flash-mcp`)。Windows 11 専用。
 
 ## Build & Test Commands
 
-```bash
+```powershell
 # ビルド
 cargo build --release
 
@@ -41,11 +41,21 @@ cargo install --path .
 ### 主要な内部関数
 
 - `resolve_project_root()` — プロジェクトルート解決（引数 → 環境変数 `GOWIN_MCP_PROJECT_ROOT` → cwd から上方探索 → cwd フォールバック）
-- `gw_sh_env()` — macOS 向けに `DYLD_LIBRARY_PATH`, `DYLD_FRAMEWORK_PATH`, `TCL_LIBRARY`, `TCLLIBPATH` を構築
-- `gowin_paths()` — Gowin IDE パス解決（デフォルト: `/Applications/GowinIDE.app`）
+- `gw_sh_env()` — Windows 向けに `PATH`（先頭に `IDE\bin` と `Programmer\bin` を追加）、`TCL_LIBRARY`、`TCLLIBPATH` を構築
+- `gowin_paths()` — Gowin IDE パス解決（デフォルト: `C:\Gowin\Gowin_V1.9.11.03_Education_x64`）
 - `exec_with_timeout()` — タイムアウト付き非同期サブプロセス実行。全ツール共通
 - `write_run_logs()` — `.gowin-mcp/logs/` にログ（`.log` + `.json`メタデータ）を書き出し
 - `parse_cable_names()` — `programmer_cli` の出力からケーブル名を抽出するパーサー
+
+### Windows 固有の前提
+
+- 想定パス: `C:\Gowin\Gowin_V1.9.11.03_Education_x64\`
+  - `IDE\bin\gw_sh.exe`
+  - `IDE\lib\`（Tcl/itcl/tcl8.6 のスタブ）
+  - `Programmer\bin\programmer_cli.exe`
+- パス区切り文字は `\`、環境変数のリスト区切りは `;` を使用
+- `PATH` を `cmd.exe` の慣例どおり `;` で連結
+- 絶対パスは `r"C:\..."` の raw string として記述
 
 ### 設計方針
 
