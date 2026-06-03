@@ -491,7 +491,7 @@ impl GowinMcp {
         let candidates: Vec<Vec<String>> = list_cables_arg_candidates();
 
         let mut attempts = Vec::new();
-        let mut cables: Vec<String> = Vec::new();
+        let mut cables: Vec<CableInfo> = Vec::new();
 
         for argv in candidates {
             let exec = exec_with_timeout(&programmer_cli, &argv, None, None, timeout_sec)
@@ -505,7 +505,7 @@ impl GowinMcp {
                 });
 
             let text = format!("{}\n{}", exec.stdout, exec.stderr);
-            let parsed = parse_cable_names(&text);
+            let parsed = parse_cable_entries(&text);
             attempts.push(Attempt {
                 args: argv,
                 exit_code: exec.exit_code,
@@ -529,7 +529,7 @@ impl GowinMcp {
                     stderr: "".into(),
                 });
             let text = format!("{}\n{}", exec.stdout, exec.stderr);
-            cables = parse_cable_names(&text);
+            cables = parse_cable_entries(&text);
             attempts.push(Attempt {
                 args: vec!["--help".into()],
                 exit_code: exec.exit_code,
@@ -553,7 +553,24 @@ impl GowinMcp {
                 .map(|a| format!("{:?} => {}", a.args, a.exit_code))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            cables.join("\n"),
+            cables
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}{}{}",
+                        c.name,
+                        c.index
+                            .as_deref()
+                            .map(|i| format!(" @ {}", i))
+                            .unwrap_or_default(),
+                        c.location
+                            .as_deref()
+                            .map(|l| format!(" [{}]", l))
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
         );
 
         let (log_file, meta_file) =
@@ -620,7 +637,7 @@ impl GowinMcp {
         }
 
         let mut selected_cable = req.cable.as_deref().map(str::trim).map(str::to_string);
-        let mut all_cables: Vec<String> = Vec::new();
+        let mut all_cables: Vec<CableInfo> = Vec::new();
         let mut list_cables_attempts: Option<Vec<Attempt>> = None;
 
         if selected_cable.is_none() {
@@ -636,7 +653,7 @@ impl GowinMcp {
                 .0;
             list_cables_attempts = Some(list.attempts.clone());
             all_cables = list.cables.clone();
-            selected_cable = all_cables.first().cloned();
+            selected_cable = all_cables.first().map(|c| c.name.clone());
         }
 
         let base_args: Vec<String> = vec![
@@ -652,6 +669,30 @@ impl GowinMcp {
 
         let mut variants: Vec<(String, Vec<String>)> = Vec::new();
 
+        // 0) Tang Nano 9K 等: ユーザー指定の cable_index + location を最優先で試す
+        //    programmer_cli の引数名 (`--cableIndex`, `--location`) は環境差があるため
+        //    候補を 1 つに絞れるならこちらの方が `--cable "USB-JTAG <idx>/<loc>"` より
+        //    安定する。
+        if let (Some(idx), Some(loc)) = (req.cable_index.as_deref(), req.location.as_deref()) {
+            for (flag_idx, flag_loc) in [
+                ("--cableIndex", "--location"),
+                ("--cable_index", "--location"),
+                ("--cableIndex", "--usbLocation"),
+            ] {
+                let mut argv = Vec::new();
+                argv.extend(base_args.iter().take(4).cloned());
+                argv.push(flag_idx.into());
+                argv.push(idx.to_string());
+                argv.push(flag_loc.into());
+                argv.push(loc.to_string());
+                argv.extend(base_args.iter().skip(4).cloned());
+                variants.push((
+                    format!("with_cable_index:{flag_idx}/{flag_loc}"),
+                    argv,
+                ));
+            }
+        }
+
         // 1) ユーザー指定の cable を最優先で試す (既に trim 済み)
         if let Some(cable) = selected_cable.clone() {
             let mut argv = Vec::new();
@@ -663,14 +704,14 @@ impl GowinMcp {
         }
 
         // 2) list_cables が返した全候補を順番に試す (1 以外)
-        for (i, cable) in all_cables.iter().enumerate().skip(1) {
-            if Some(cable.as_str()) == selected_cable.as_deref() {
+        for (i, info) in all_cables.iter().enumerate().skip(1) {
+            if Some(info.name.as_str()) == selected_cable.as_deref() {
                 continue;
             }
             let mut argv = Vec::new();
             argv.extend(base_args.iter().take(4).cloned());
             argv.push("--cable".into());
-            argv.push(cable.clone());
+            argv.push(info.name.clone());
             argv.extend(base_args.iter().skip(4).cloned());
             variants.push((format!("with_cable[{}]", i), argv));
         }
@@ -748,6 +789,8 @@ impl GowinMcp {
             "device": device,
             "frequency": frequency,
             "retries": retries,
+            "cable_index": req.cable_index,
+            "location": req.location,
             "selected_cable": selected_cable,
             "list_cables_attempts": list_cables_attempts,
             "variants_tried": tried,
@@ -841,6 +884,17 @@ struct Attempt {
     exit_code: i32,
 }
 
+/// Parsed cable entry: name, 1-based index, and USB location id.
+///
+/// `Cable found: USB Debugger A/1/321/null (USB location:321)`
+/// → `CableInfo { name: "USB Debugger A", index: Some("1"), location: Some("321") }`
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+struct CableInfo {
+    name: String,
+    index: Option<String>,
+    location: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ListCablesRequest {
     project_root: Option<String>,
@@ -852,7 +906,7 @@ struct ListCablesRequest {
 struct ListCablesResponse {
     project_root: String,
     gowin_ide_path: String,
-    cables: Vec<String>,
+    cables: Vec<CableInfo>,
     attempts: Vec<Attempt>,
     log_file: String,
     meta_file: String,
@@ -867,7 +921,19 @@ struct ProgramFsRequest {
     frequency: Option<String>,
     retries: Option<u32>,
     timeout_sec: Option<u64>,
+    /// Cable name (e.g. "USB Debugger A").
+    /// If omitted, the first cable returned by `list_cables` is used.
+    /// Combine with `cable_index` and `location` when known.
     cable: Option<String>,
+    /// 1-based cable index from the `Cable found:` line (the segment after the
+    /// first "/"). Omit to use programmer_cli's default behaviour.
+    cable_index: Option<String>,
+    /// USB location ID from the `Cable found:` line (the numeric segment
+    /// before "/null", e.g. "321"). Omit to use programmer_cli's default.
+    location: Option<String>,
+    /// Operation index. 2 = SRAM Program (volatile, ~7-10s), 5 = embFlash
+    /// Erase+Program (permanent, ~30-60s). Default: 2.
+    operation_index: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -894,16 +960,27 @@ struct ProgramFsResponse {
 }
 
 fn parse_cable_names(text: &str) -> Vec<String> {
-    // Windows 11 / Gowin programmer_cli 実機で観察される出力形式に対応する。
-    // 入力は自由形式テキスト (stdout + stderr)。発見順に重複排除して返す。
-    //
-    // 主な抽出対象:
-    //   "Target Cable: Gowin USB Cable(FT2CH)"
-    //   "Cable found: Gowin USB Cable(FT2CH)"
-    //   "  1. Gowin USB Cable(FT2CH)"  (番号付きリスト)
-    //   [1] "Gowin USB Cable(FT2CH)"
-    //   引用符で囲まれた名前
-    let mut found: Vec<String> = Vec::new();
+    parse_cable_entries(text)
+        .into_iter()
+        .map(|c| c.name)
+        .collect()
+}
+
+/// Windows 11 / Gowin programmer_cli 実機の出力から、ケーブル情報 (名前 +
+/// index + location) を抽出する。
+///
+/// 主な抽出対象:
+///   "Target Cable: Gowin USB Cable(FT2CH)"
+///   "Cable found: Gowin USB Cable(FT2CH)/1/321/null"
+///   "Cable Name: Gowin USB Cable(FT2CH)"
+///   [1] "Gowin USB Cable(FT2CH)"
+///   番号付きリスト "1. Gowin USB Cable(FT2CH)"
+///
+/// `Cable found:` 行で `/idx/loc/null` サフィックスを見つけた場合、
+/// `CableInfo.index` と `CableInfo.location` に分離して格納する。
+/// 同じ name を 2 度拾った場合は先に格納した entry を優先する。
+fn parse_cable_entries(text: &str) -> Vec<CableInfo> {
+    let mut found: Vec<CableInfo> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for raw_line in text.lines() {
@@ -912,31 +989,23 @@ fn parse_cable_names(text: &str) -> Vec<String> {
             continue;
         }
 
-        // 0) 「Target Cable: ...」「Cable found: ...」形式 (Windows programmer_cli 実機の出力)
-        //    ラベル側は case-insensitive でマッチさせ、値側のみ抽出する。
+        // 0) 「Target Cable: ...」「Cable found: ...」形式
         for label in ["Target Cable:", "Cable found:", "Cable:", "Cable Name:"] {
             if let Some(pos) = line.to_lowercase().find(&label.to_lowercase()) {
                 let value_start = pos + label.len();
-                let v = line[value_start..].trim().trim_matches('"').trim();
-                push_if_cable_like(&mut found, &mut seen, v);
+                let raw = line[value_start..].trim().trim_matches('"').trim();
+                push_cable_entry(&mut found, &mut seen, raw);
             }
         }
 
-        // 0b) programmer_cli のスキャン形式: "IDCode : 0x..." 単独行で、その直前行/前行群に
-        //     ケーブル名が含まれているケース。実機では次のようなブロックが観察される:
-        //         cable index:0
-        //         Cable Name: Gowin USB Cable(FT2CH)
-        //         IDCode : 0x0110083B
-        //     上記 (1) の "Cable Name:" で既に拾えるが、IDCode 単独行が来たタイミングでも
-        //     直前の抽出済み名前にサフィックス除去を再度かけて、ケーブル名の安定性を上げる。
+        // 0b) IDCode 単独行でもサフィックス除去 (冪等)
         if line.to_lowercase().contains("idcode") {
-            // 直近で push 済みの最後にサフィックス除去を適用 (冪等なので問題なし)
             if let Some(last) = found.last_mut() {
-                let cleaned = strip_cable_suffix(last);
-                if !cleaned.is_empty() && cleaned != *last {
-                    if seen.remove(last) {
-                        seen.insert(cleaned.clone());
-                        *last = cleaned;
+                let cleaned_name = strip_cable_suffix(&last.name);
+                if !cleaned_name.is_empty() && cleaned_name != last.name {
+                    if seen.remove(&last.name) {
+                        seen.insert(cleaned_name.clone());
+                        last.name = cleaned_name;
                     }
                 }
             }
@@ -948,7 +1017,7 @@ fn parse_cable_names(text: &str) -> Vec<String> {
             let after = &rest[start + 1..];
             if let Some(end) = after.find('"') {
                 let v = after[..end].trim();
-                push_if_cable_like(&mut found, &mut seen, v);
+                push_cable_entry(&mut found, &mut seen, v);
                 rest = &after[end + 1..];
             } else {
                 break;
@@ -961,7 +1030,6 @@ fn parse_cable_names(text: &str) -> Vec<String> {
                 c.is_ascii_digit() || c == '[' || c == ']' || c == '.' || c == ')' || c == '-'
             })
             .trim();
-        // 全体が "Gowin ... Cable ..." で、明らかに名前っぽい短い行なら採用
         if !stripped.is_empty() && stripped.len() <= 80 {
             let low = stripped.to_lowercase();
             if (low.starts_with("gowin") && low.contains("cable"))
@@ -969,12 +1037,71 @@ fn parse_cable_names(text: &str) -> Vec<String> {
                 || low.contains("ft2ch")
                 || low.contains("ft2232")
             {
-                push_if_cable_like(&mut found, &mut seen, stripped);
+                push_cable_entry(&mut found, &mut seen, stripped);
             }
         }
     }
 
     found
+}
+
+fn push_cable_entry(
+    found: &mut Vec<CableInfo>,
+    seen: &mut std::collections::HashSet<String>,
+    candidate: &str,
+) {
+    let trimmed = candidate.trim().trim_matches('"').trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    // "Name/idx/loc/null" 形式を分解する。strip_cable_suffix と同じく、
+    // "/" の個数が 2 以上のときだけサフィックス付きとみなす。
+    let (name, idx, loc) = if trimmed.matches('/').count() >= 2 {
+        if let Some(slash_pos) = trimmed.find('/') {
+            let head = trimmed[..slash_pos].trim();
+            let tail = &trimmed[slash_pos + 1..];
+            let parts: Vec<&str> = tail.split('/').map(|p| p.trim()).collect();
+            let idx = parts.first().copied().filter(|s| !s.is_empty()).map(String::from);
+            // location は最後から 2 番目 (例: "Gowin USB Cable(FT2CH)/0/0/null" → loc="0")
+            let loc = parts
+                .iter()
+                .rev()
+                .nth(1)
+                .copied()
+                .filter(|s| !s.is_empty())
+                .map(String::from);
+            (head.to_string(), idx, loc)
+        } else {
+            (trimmed.to_string(), None, None)
+        }
+    } else {
+        (trimmed.to_string(), None, None)
+    };
+
+    let name = strip_cable_suffix(&name);
+    if name.is_empty() || name.len() < 3 {
+        return;
+    }
+    let low = name.to_lowercase();
+    let cable_like = low.contains("cable")
+        || low.contains("gowin")
+        || low.contains("ft2ch")
+        || low.contains("ft2232")
+        || low.contains("ft232")
+        || low.contains("ft60x")
+        || (low.contains("usb") && (low.contains("debugger") || low.contains("debug")))
+        || low.contains("jtag");
+    if !cable_like {
+        return;
+    }
+    if seen.insert(name.clone()) {
+        found.push(CableInfo {
+            name,
+            index: idx,
+            location: loc,
+        });
+    }
 }
 
 fn push_if_cable_like(
@@ -991,12 +1118,17 @@ fn push_if_cable_like(
         return;
     }
     let low = v.to_lowercase();
-    // "cable" を含むか、FTDI 系 / Gowin 系のヒント語を含むか
+    // "cable" を含むか、FTDI 系 / Gowin 系 / "USB Debugger" 系のヒント語を含むか。
+    // "USB Debugger A" のような Sipeed 公式ケーブルは "cable" を含まないが、
+    // "usb" + "debugger" の組み合わせで識別する。
     let cable_like = low.contains("cable")
         || low.contains("gowin")
         || low.contains("ft2ch")
         || low.contains("ft2232")
-        || low.contains("usb");
+        || low.contains("ft232")
+        || low.contains("ft60x")
+        || (low.contains("usb") && (low.contains("debugger") || low.contains("debug")))
+        || low.contains("jtag");
     if !cable_like {
         return;
     }
