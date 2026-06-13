@@ -24,6 +24,11 @@ use tokio::{
 
 const DEFAULT_GOWIN_IDE_PATH: &str = r"C:\Gowin\Gowin_V1.9.11.03_Education_x64";
 const DEFAULT_PROJECT_ROOT_ENV: &str = "GOWIN_MCP_PROJECT_ROOT";
+
+fn log_warning(msg: &str) {
+    // stderr に出してログファイル (.gowin-mcp/logs/*.log) にも拾われる。
+    eprintln!("[gowin-mcp WARN] {msg}");
+}
 const KILL_WAIT_TIMEOUT_SEC: u64 = 10;
 const MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
 
@@ -150,17 +155,20 @@ fn resolve_under(project_root: &Path, p: &str) -> PathBuf {
 }
 
 fn list_cables_arg_candidates() -> Vec<Vec<String>> {
+    // programmer_cli v1.9.8.07 (Education) の公式フラグは `--scan-cables`。
+    // 旧バージョンや別ビルドとの互換性のため他候補も残すが、
+    // `--scan-cables` を先頭に置く。
     vec![
+        vec!["--scan-cables".into()],
+        vec!["--scan".into()],
         vec!["--list-cables".into()],
         vec!["--list_cables".into()],
         vec!["--cableList".into()],
         vec!["--listCable".into()],
         vec!["--cables".into()],
-        vec!["--scan-cables".into()],
         vec!["--scan_cables".into()],
         vec!["-l".into()],
         vec!["--list".into()],
-        vec!["--scan".into()],
         vec!["--enumerate".into()],
     ]
 }
@@ -607,13 +615,22 @@ impl GowinMcp {
 
         let (_ide_base, _gw_sh, programmer_cli) = gowin_paths(gowin_ide_path);
 
-        let fs_file_path = req
-            .fs_file_path
-            .as_deref()
-            .unwrap_or("fpgaOscillator/impl/pnr/fpgaOscillator.fs");
+        let fs_file_path = req.fs_file_path.as_deref().ok_or_else(|| {
+            McpError::new(
+                ErrorCode::INVALID_PARAMS,
+                "fs_file_path を指定してください（例: fpgaOscillator/impl/pnr/fpgaOscillator.fs）",
+                None,
+            )
+        })?;
         let fs_abs = resolve_under(&project_root, fs_file_path);
 
-        let device = req.device.unwrap_or_else(|| "GW5A-25A".into());
+        let device = req.device.ok_or_else(|| {
+            McpError::new(
+                ErrorCode::INVALID_PARAMS,
+                "device を指定してください（例: GW1N-9C, GW2A-LV18PG256C8/I7, GW5A-25A）。board の chip 名に合わせてください",
+                None,
+            )
+        })?;
         let frequency = req.frequency.unwrap_or_else(|| "15MHz".into());
         let retries = req.retries.unwrap_or(2);
         let timeout_sec = req.timeout_sec.unwrap_or(120);
@@ -636,25 +653,23 @@ impl GowinMcp {
             ));
         }
 
-        let mut selected_cable = req.cable.as_deref().map(str::trim).map(str::to_string);
-        let mut all_cables: Vec<CableInfo> = Vec::new();
-        let mut list_cables_attempts: Option<Vec<Attempt>> = None;
-
-        if selected_cable.is_none() {
-            // 内部的に list_cables を呼んで全件取得。
-            // 先頭だけでなく全候補で `--cable` を試行できるよう保存する。
-            let list = self
-                .list_cables(Parameters(ListCablesRequest {
-                    project_root: Some(project_root.display().to_string()),
-                    gowin_ide_path: Some(gowin_ide_path.to_string()),
-                    timeout_sec: Some(timeout_sec.min(20)),
-                }))
-                .await?
-                .0;
-            list_cables_attempts = Some(list.attempts.clone());
-            all_cables = list.cables.clone();
-            selected_cable = all_cables.first().map(|c| c.name.clone());
-        }
+        // Sipeed がカスタムした Gowin Programmer (Tang Nano 9K の onboard
+        // programmer) は `programmer_cli --list_cables` で
+        //   `USB Debugger A/1/321/null`
+        // として報告される。list_cables を毎回走らせると 5–10s 追加でかかる上、
+        // ボードを 1 個しかつなぐ想定なので固定で良い。`--cable` にそのまま渡せる
+        // 名前 "USB Debugger A" をハードコードする。
+        const DEFAULT_CABLE: &str = "USB Debugger A";
+        let user_cable = req
+            .cable
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut selected_cable: Option<String> =
+            Some(user_cable.clone().unwrap_or_else(|| DEFAULT_CABLE.to_string()));
+        let list_cables_attempts: Option<Vec<Attempt>> = None;
+        let all_cables: Vec<CableInfo> = Vec::new();
 
         let base_args: Vec<String> = vec![
             "-r".into(),
@@ -670,30 +685,62 @@ impl GowinMcp {
         let mut variants: Vec<(String, Vec<String>)> = Vec::new();
 
         // 0) Tang Nano 9K 等: ユーザー指定の cable_index + location を最優先で試す
-        //    programmer_cli の引数名 (`--cableIndex`, `--location`) は環境差があるため
-        //    候補を 1 つに絞れるならこちらの方が `--cable "USB-JTAG <idx>/<loc>"` より
-        //    安定する。
-        if let (Some(idx), Some(loc)) = (req.cable_index.as_deref(), req.location.as_deref()) {
-            for (flag_idx, flag_loc) in [
-                ("--cableIndex", "--location"),
-                ("--cable_index", "--location"),
-                ("--cableIndex", "--usbLocation"),
-            ] {
+        //
+        // programmer_cli v1.9.8.07 (Education) の公式フラグは:
+        //   --cable-index <int>   0..4 (4 = "USB Debugger A")
+        //   --channel <int>       USB location (FT2CH 系) または device channel
+        //   --location <int>      "Will ignore --channel option" (FT2CH のみ)
+        //
+        // 注意: `--location 627` を渡すと "USB Debugger A/0/0/null" を引いて
+        //       cable open failed になる。`--channel 273` が正しい。
+        if let (Some(idx), Some(channel)) = (req.cable_index.as_deref(), req.location.as_deref()) {
+            // a) 公式フラグ: --cable-index <idx> --channel <channel>
+            {
                 let mut argv = Vec::new();
                 argv.extend(base_args.iter().take(4).cloned());
-                argv.push(flag_idx.into());
+                argv.push("--cable-index".into());
                 argv.push(idx.to_string());
-                argv.push(flag_loc.into());
-                argv.push(loc.to_string());
+                argv.push("--channel".into());
+                argv.push(channel.to_string());
                 argv.extend(base_args.iter().skip(4).cloned());
                 variants.push((
-                    format!("with_cable_index:{flag_idx}/{flag_loc}"),
+                    "with_cable_index:official".into(),
+                    argv,
+                ));
+            }
+            // b) 別表記フォールバック (古い CLI 互換)
+            {
+                let mut argv = Vec::new();
+                argv.extend(base_args.iter().take(4).cloned());
+                argv.push("--cable-index".into());
+                argv.push(idx.to_string());
+                argv.push("--location".into());
+                argv.push(channel.to_string());
+                argv.extend(base_args.iter().skip(4).cloned());
+                variants.push((
+                    "with_cable_index:--location".into(),
+                    argv,
+                ));
+            }
+            // c) cable-index のみ (channel 省略)
+            {
+                let mut argv = Vec::new();
+                argv.extend(base_args.iter().take(4).cloned());
+                argv.push("--cable-index".into());
+                argv.push(idx.to_string());
+                argv.extend(base_args.iter().skip(4).cloned());
+                variants.push((
+                    "with_cable_index:no_channel".into(),
                     argv,
                 ));
             }
         }
 
         // 1) ユーザー指定の cable を最優先で試す (既に trim 済み)
+        //
+        // `--cable` は programmer_cli 側で「ケーブル種類の文字列」を期待する。
+        // 例: "Gowin USB Cable(FT2CH)" / "USB Debugger A"。
+        // cable 名がそのまま使える形式であればこの経路でも OK。
         if let Some(cable) = selected_cable.clone() {
             let mut argv = Vec::new();
             argv.extend(base_args.iter().take(4).cloned());
@@ -1101,39 +1148,6 @@ fn push_cable_entry(
             index: idx,
             location: loc,
         });
-    }
-}
-
-fn push_if_cable_like(
-    found: &mut Vec<String>,
-    seen: &mut std::collections::HashSet<String>,
-    candidate: &str,
-) {
-    let v = strip_cable_suffix(candidate.trim().trim_matches('"').trim());
-    if v.is_empty() {
-        return;
-    }
-    // 明らかにノイズ (バージョン番号やカッコ内に閉じている単体記号など) を弾く
-    if v.len() < 3 {
-        return;
-    }
-    let low = v.to_lowercase();
-    // "cable" を含むか、FTDI 系 / Gowin 系 / "USB Debugger" 系のヒント語を含むか。
-    // "USB Debugger A" のような Sipeed 公式ケーブルは "cable" を含まないが、
-    // "usb" + "debugger" の組み合わせで識別する。
-    let cable_like = low.contains("cable")
-        || low.contains("gowin")
-        || low.contains("ft2ch")
-        || low.contains("ft2232")
-        || low.contains("ft232")
-        || low.contains("ft60x")
-        || (low.contains("usb") && (low.contains("debugger") || low.contains("debug")))
-        || low.contains("jtag");
-    if !cable_like {
-        return;
-    }
-    if seen.insert(v.to_string()) {
-        found.push(v.to_string());
     }
 }
 

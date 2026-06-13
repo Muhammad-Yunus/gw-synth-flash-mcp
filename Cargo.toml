@@ -5,8 +5,8 @@ repository = "https://github.com/AkiyukiOkayasu/gw-synth-flash-mcp"
 version = "0.1.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "An unofficial MCP server for Gowin IDE CLI workflows as tools."
-keywords = ["gowin", "mcp", "fpga"]
+description = "An unofficial MCP server for Gowin EDA CLI workflows (gw_sh, programmer_cli) on Windows 11."
+keywords = ["gowin", "mcp", "fpga", "windows"]
 categories = [
     "command-line-utilities",
     "development-tools::build-utils",
